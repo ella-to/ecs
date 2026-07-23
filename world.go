@@ -12,15 +12,20 @@ import "reflect"
 //	w.Set(e, Position{X: 10})
 //	pos := w.Get[Position](e)
 type World struct {
-	versions []uint32 // current version per entity index
-	free     []uint32 // destroyed indices ready for reuse
-	storages map[reflect.Type]storage
-	list     []storage // same storages as a flat slice — Destroy iterates this, not the map
+	versions   []uint32 // current version per entity index
+	free       []uint32 // destroyed indices ready for reuse
+	storages   map[reflect.Type]storage
+	list       []storage // same storages as a flat slice — Destroy iterates this, not the map
+	events     map[reflect.Type]eventQueue
+	eventsList []eventQueue // same queues as a flat slice — FlushEvents iterates this
 }
 
 // NewWorld creates an empty World.
 func NewWorld() *World {
-	return &World{storages: make(map[reflect.Type]storage)}
+	return &World{
+		storages: make(map[reflect.Type]storage),
+		events:   make(map[reflect.Type]eventQueue),
+	}
 }
 
 // NewEntity creates a new entity with no components.

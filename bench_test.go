@@ -122,3 +122,26 @@ func BenchmarkCreateDestroy(b *testing.B) {
 		w.Destroy(e)
 	}
 }
+
+// BenchmarkEvents is one frame of steady-state event traffic: a producer
+// sends 1000 events, a consumer reads them, and the frame ends with
+// FlushEvents. Buffer capacity is reused across frames, so nothing
+// allocates.
+func BenchmarkEvents(b *testing.B) {
+	const eventsPerFrame = 1000
+	w := NewWorld()
+	ev := w.Events[clicked]()
+	r := ev.Reader()
+	b.ReportAllocs()
+	b.ResetTimer()
+	sum := 0
+	for b.Loop() {
+		for i := range eventsPerFrame {
+			ev.Send(clicked{N: i})
+		}
+		r.Each(func(e clicked) { sum += e.N })
+		w.FlushEvents()
+	}
+	_ = sum
+	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N)/eventsPerFrame, "ns/event")
+}
