@@ -1,6 +1,6 @@
 module ella.to/ecs/examples/gopher
 
-go 1.27rc1
+go 1.27rc2
 
 require (
 	ella.to/ecs v0.0.1

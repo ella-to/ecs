@@ -1,3 +1,3 @@
 module ella.to/ecs
 
-go 1.27rc1
+go 1.27rc2
