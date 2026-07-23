@@ -67,6 +67,71 @@ typed slice access. The only reflection is one `map[reflect.Type]` lookup to
 find a storage, and queries do that once at construction, never during
 iteration.
 
+## Events
+
+Systems often need to tell each other things — "this button was clicked",
+"that enemy died" — and the tempting shortcuts (shared variables, one system
+calling another) couple systems together and break the ECS model. `Events[T]`
+is the decoupled alternative: a per-type, double-buffered queue that producers
+push into and any number of consumers poll at their own pace.
+
+```go
+type ButtonClicked struct{ Button ecs.Entity }
+
+// Producer (in its constructor, then per frame):
+clicks := w.Events[ButtonClicked]()
+clicks.Send(ButtonClicked{Button: e})
+
+// Consumer (each system makes its own reader in its constructor):
+reader := w.Events[ButtonClicked]().Reader()
+reader.Each(func(ev ButtonClicked) { ... })
+
+// Once per frame, after all systems ran:
+w.FlushEvents()
+```
+
+Producer and consumer never reference each other — the event type is their
+entire contract. `w.Send(event)` is the map-lookup convenience twin of
+`w.Set`, for code outside hot paths.
+
+The design is the one that won out across the ECS ecosystem (it is Bevy's
+`Events`/`EventReader`, and what EnTT's author recommends over its own
+callback dispatcher): **pull, not push**. Callbacks/observers run consumer
+code in the middle of the producer's iteration — reentrancy hazards,
+unpredictable ordering, per-event dispatch overhead. A polled queue keeps
+every system running on the schedule you gave it, and processing N events is
+one batched linear walk. The "events as entities" pattern (spawn an entity
+per event, query it, destroy it) works with plain component storage but pays
+entity churn and needs fragile manual cleanup; a dedicated queue does less
+work and can't leak.
+
+Semantics that follow from the double buffer:
+
+- **Events live for exactly two flushes.** A consumer scheduled *before* the
+  producer still sees the event on the next frame — one frame late, never
+  lost. The flip side: a system must poll its reader every frame (or call
+  `reader.Clear()` to skip); anything unread after two flushes is gone.
+- **Readers are independent cursors.** Reading never removes events, so any
+  number of systems can consume the same queue. Each reader tracks a
+  monotonic sequence number, so buffer swaps can't corrupt its position. A
+  fresh reader sees whatever is still buffered (up to two frames of history).
+- **Call `w.FlushEvents()` exactly once per frame**, after all systems.
+  Forgetting it means queues grow without bound; calling it twice halves
+  event lifetime to "this frame only".
+- **Events sent from inside `Each` are deferred** to the next `Each` call,
+  so a system that reacts to events by sending more (same type) cannot loop
+  forever.
+- **Treat events as immutable messages.** `Each` passes them by value; every
+  reader of a queue sees the same events.
+- Same concurrency rule as the rest of the world: not goroutine-safe, no
+  `Send` inside an `EachParallel` pass.
+
+Performance: `Send` is an append into a slice whose capacity is reused after
+every flush, reading is a linear walk of packed memory, and `FlushEvents` is
+one swap per event type. Steady state allocates nothing (see
+`BenchmarkEvents`: ~3 ns/event, 0 allocs). Worlds that never touch events pay
+nothing — the feature is invisible until the first `w.Events[T]()` call.
+
 ## Performance
 
 Running, `go test -bench=. -benchmem .`, 100 000 entities:
@@ -79,6 +144,7 @@ Running, `go test -bench=. -benchmem .`, 100 000 entities:
 | Raw slice loop (no ECS, upper bound) | 0.76 ns/entity |
 | `Get` / `Set` existing | ~9 ns · 0 allocs |
 | create + 2×`Set` + `Destroy` | 35 ns · 0 allocs |
+| `Events` send + read + flush (1000/frame) | **2.9 ns/event** · 0 allocs |
 
 At 60 FPS a frame budget is 16.6 ms; a full two-component pass over 100k
 entities costs 0.18 ms. Nothing allocates, so the GC stays idle no matter how
@@ -251,7 +317,9 @@ Practical guidance, in rough order of impact:
 | `world.go` | `World`: entity lifecycle, generic `Set`/`Get`/`Has`/`Remove` |
 | `storage.go` | `Storage[T]`: the sparse set |
 | `query.go` | `Query` through `Query5`: cached, allocation-free iteration; `EachParallel` for multi-core passes |
+| `events.go` | `Events[T]` / `EventReader[T]`: double-buffered event queues for system-to-system messaging |
 | `ecs_test.go` | correctness tests, including the edge cases above |
+| `events_test.go` | event lifetime, ordering, and zero-allocation tests |
 | `bench_test.go` | the benchmarks quoted above |
 
 ## Examples
@@ -261,5 +329,6 @@ Practical guidance, in rough order of impact:
 | `examples/simple` | a keyboard-controlled box (Ebiten): input, movement, and render systems |
 | `examples/particles` | click-to-explode particle bursts (Ebiten): spawn on mouse click, gravity + drag physics, lifetime-driven destruction, and a `Query4` render pass with fading motion streaks |
 | `examples/gopher` | bunnymark-style stress test (Ebiten): `-n` gophers bounce off the view edges, hold the mouse to pour in more, FPS/TPS and per-system timings on screen |
+| `examples/ui` | a login form (Ebiten) showing the events API: `TextInput` (label, placeholder, password, error) and `Button` (disabled, loading) components; the widget systems publish `TextChanged`/`ButtonClicked` events and a fully decoupled `LoginSystem` polls them |
 
 Run one with `go run ./examples/particles`.
