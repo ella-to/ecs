@@ -15,6 +15,7 @@ p := w.Get[Position](e)              // *Position, or nil
 w.Has[Velocity](e)                   // true
 w.Remove[Velocity](e)
 w.Destroy(e)                         // removes e and all its components
+w.Clean()                            // removes everything — scene transitions
 
 // Build once (e.g. in a system's constructor), reuse every frame:
 q := w.Query2[Position, Velocity]()
@@ -145,6 +146,7 @@ Running, `go test -bench=. -benchmem .`, 100 000 entities:
 | `Get` / `Set` existing | ~9 ns · 0 allocs |
 | create + 2×`Set` + `Destroy` | 35 ns · 0 allocs |
 | `Events` send + read + flush (1000/frame) | **2.9 ns/event** · 0 allocs |
+| `Clean` (100k entities × 5 components) | 63 µs · 0 allocs — **37× a `Destroy` loop** |
 
 At 60 FPS a frame budget is 16.6 ms; a full two-component pass over 100k
 entities costs 0.18 ms. Nothing allocates, so the GC stays idle no matter how
@@ -178,6 +180,39 @@ The version counter is 32-bit, so a *single* index would need ~4.3 billion
 destroy/recreate cycles before its version wraps and a stale handle could
 falsely match. At 60 FPS that is over two years of destroying the same slot
 every frame — theoretical, but stated for completeness.
+
+### Resetting the world for a new scene
+
+`Clean` empties the world — every entity, component, and buffered event —
+without giving back the memory:
+
+```go
+func (g *Game) LoadScene(s Scene) {
+    g.world.Clean()
+    s.Spawn(g.world)   // rebuilds into arrays that are already the right size
+}
+```
+
+The systems you built at startup keep working: `Clean` empties the storages in
+place, so a cached `*Storage[T]` and any `Query` still point at the right
+thing and observe the cleaned world. Nothing needs to be reconstructed.
+
+It is not a `Destroy` loop. `Destroy` probes every storage for one entity, so
+tearing a scene down that way costs entities × component types; `Clean` empties
+each storage in one shot, leaving a single pass over the version table — 37×
+faster on the benchmark above, and it stays flat as you add component types.
+
+Two consequences worth knowing:
+
+- **Every handle taken before the call is dead**, exactly as if each entity had
+  been destroyed — including handles stored in components. Don't carry an
+  `Entity` across a `Clean`.
+- **Buffered events are dropped.** Otherwise a queue could deliver the previous
+  scene's events, carrying its now-dead entities, into the scene that replaced
+  it. Reader cursors stay valid and resume at the next event sent.
+
+Since the arrays are retained, the second scene load and every one after it
+allocates nothing at all.
 
 ### Component pointers are invalidated by structural changes
 

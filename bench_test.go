@@ -145,3 +145,77 @@ func BenchmarkEvents(b *testing.B) {
 	_ = sum
 	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N)/eventsPerFrame, "ns/event")
 }
+
+// benchSceneComponents is how many component types a scene transition has to
+// tear down — the axis Clean is meant to be independent of.
+const benchSceneComponents = 5
+
+func newSceneWorld() *World {
+	w := NewWorld()
+	for range benchEntities {
+		e := w.NewEntity()
+		w.Set(e, pos{})
+		w.Set(e, vel{})
+		w.Set(e, acc{})
+		w.Set(e, hp{})
+		w.Set(e, tag{})
+	}
+	return w
+}
+
+// BenchmarkClean is a scene transition: tear down 100k entities × 5 component
+// types. Compare with BenchmarkCleanByDestroy, the loop it replaces.
+func BenchmarkClean(b *testing.B) {
+	w := newSceneWorld()
+	live := make([]Entity, 0, benchEntities)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		w.Clean()
+
+		b.StopTimer()
+		live = live[:0]
+		for range benchEntities {
+			e := w.NewEntity()
+			w.Set(e, pos{})
+			w.Set(e, vel{})
+			w.Set(e, acc{})
+			w.Set(e, hp{})
+			w.Set(e, tag{})
+			live = append(live, e)
+		}
+		b.StartTimer()
+	}
+}
+
+// BenchmarkCleanByDestroy is the same teardown written as a Destroy loop:
+// every entity probes every storage, so it scales with entities × component
+// types where Clean does not.
+func BenchmarkCleanByDestroy(b *testing.B) {
+	w := newSceneWorld()
+	live := make([]Entity, 0, benchEntities)
+	q := w.Query[pos]()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		b.StopTimer()
+		live = live[:0]
+		q.Each(func(e Entity, _ *pos) { live = append(live, e) })
+		b.StartTimer()
+
+		for _, e := range live {
+			w.Destroy(e)
+		}
+
+		b.StopTimer()
+		for range benchEntities {
+			e := w.NewEntity()
+			w.Set(e, pos{})
+			w.Set(e, vel{})
+			w.Set(e, acc{})
+			w.Set(e, hp{})
+			w.Set(e, tag{})
+		}
+		b.StartTimer()
+	}
+}

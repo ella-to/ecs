@@ -1,6 +1,8 @@
 package ecs
 
 import (
+	"reflect"
+	"runtime"
 	"sync"
 	"testing"
 )
@@ -334,4 +336,229 @@ func TestDestroyDuringIteration(t *testing.T) {
 	if n := w.Query[pos]().Count(); n != 0 {
 		t.Fatalf("%d entities left after destroying all, want 0", n)
 	}
+}
+
+func TestCleanEmptiesWorld(t *testing.T) {
+	w := NewWorld()
+	for i := range 100 {
+		e := w.NewEntity()
+		w.Set(e, pos{X: float64(i)})
+		if i%2 == 0 {
+			w.Set(e, vel{X: 1})
+		}
+	}
+
+	w.Clean()
+
+	if n := w.Query[pos]().Count(); n != 0 {
+		t.Fatalf("%d pos components left after Clean, want 0", n)
+	}
+	if n := w.Storage[vel]().Len(); n != 0 {
+		t.Fatalf("%d vel components left after Clean, want 0", n)
+	}
+	w.Query2[pos, vel]().Each(func(Entity, *pos, *vel) {
+		t.Fatal("Query2 matched an entity after Clean")
+	})
+}
+
+func TestCleanInvalidatesHandles(t *testing.T) {
+	w := NewWorld()
+	var old []Entity
+	for i := range 10 {
+		e := w.NewEntity()
+		w.Set(e, pos{X: float64(i)})
+		old = append(old, e)
+	}
+	// A hole in the middle: this index is already on the free list when Clean
+	// runs, and must not end up there twice.
+	w.Destroy(old[4])
+
+	w.Clean()
+
+	// Repopulating reuses every index, including the one freed before Clean.
+	fresh := make(map[uint32]bool)
+	for range 10 {
+		e := w.NewEntity()
+		if fresh[e.index()] {
+			t.Fatalf("index %d handed out twice after Clean", e.index())
+		}
+		fresh[e.index()] = true
+		w.Set(e, pos{X: -1})
+	}
+
+	// None of the pre-Clean handles may alias the entities that replaced them.
+	for i, e := range old {
+		if w.Alive(e) {
+			t.Fatalf("stale handle %d alive after Clean", i)
+		}
+		if p := w.Get[pos](e); p != nil {
+			t.Fatalf("stale handle %d reads component %v after Clean", i, p)
+		}
+		w.Set(e, pos{X: 999}) // no-op on a dead entity
+	}
+	if n := w.Query[pos]().Count(); n != 10 {
+		t.Fatalf("Count = %d after refill, want 10", n)
+	}
+	w.Query[pos]().Each(func(_ Entity, p *pos) {
+		if p.X != -1 {
+			t.Fatalf("stale handle wrote through to a new entity: %v", p)
+		}
+	})
+}
+
+func TestCleanKeepsCachedStoragesAndQueries(t *testing.T) {
+	w := NewWorld()
+	// Systems resolve these once at construction and keep them across scenes.
+	store := w.Storage[pos]()
+	q := w.Query2[pos, vel]()
+
+	e := w.NewEntity()
+	store.Set(e, pos{X: 1})
+	w.Set(e, vel{X: 1})
+
+	w.Clean()
+
+	if store.Len() != 0 {
+		t.Fatalf("cached storage sees %d components after Clean, want 0", store.Len())
+	}
+
+	e2 := w.NewEntity()
+	store.Set(e2, pos{X: 7})
+	w.Set(e2, vel{X: 8})
+
+	matched := 0
+	q.Each(func(_ Entity, p *pos, v *vel) {
+		matched++
+		if p.X != 7 || v.X != 8 {
+			t.Fatalf("cached query sees stale data: %v %v", p, v)
+		}
+	})
+	if matched != 1 {
+		t.Fatalf("cached query matched %d entities after Clean, want 1", matched)
+	}
+}
+
+func TestCleanDropsEventsAndKeepsReadersUsable(t *testing.T) {
+	w := NewWorld()
+	ev := w.Events[clicked]()
+	// Two readers at different cursors: one has consumed the buffer, one has
+	// not. Neither may replay or skip once Clean drops what is buffered.
+	caughtUp, behind := ev.Reader(), ev.Reader()
+
+	ev.Send(clicked{N: 1})
+	w.FlushEvents()
+	ev.Send(clicked{N: 2})
+	caughtUp.Each(func(clicked) {})
+
+	w.Clean()
+
+	for name, r := range map[string]*EventReader[clicked]{"caught-up": &caughtUp, "behind": &behind} {
+		var got []int
+		r.Each(func(c clicked) { got = append(got, c.N) })
+		if len(got) != 0 {
+			t.Fatalf("%s reader saw %v after Clean, want nothing", name, got)
+		}
+	}
+
+	ev.Send(clicked{N: 3})
+	for name, r := range map[string]*EventReader[clicked]{"caught-up": &caughtUp, "behind": &behind} {
+		var got []int
+		r.Each(func(c clicked) { got = append(got, c.N) })
+		if len(got) != 1 || got[0] != 3 {
+			t.Fatalf("%s reader saw %v after Clean, want [3]", name, got)
+		}
+	}
+}
+
+func TestCleanDoesNotAllocate(t *testing.T) {
+	w := NewWorld()
+	spawn := func() {
+		for i := range 1000 {
+			e := w.NewEntity()
+			w.Set(e, pos{X: float64(i)})
+			w.Set(e, vel{X: 1})
+		}
+	}
+	// Warm every array to its steady-state capacity first: the point of Clean
+	// is that a scene transition reuses them.
+	spawn()
+	w.Clean()
+	spawn()
+
+	allocs := testing.AllocsPerRun(50, func() {
+		w.Clean()
+		spawn()
+	})
+	if allocs != 0 {
+		t.Fatalf("clean + respawn allocates %.1f times, want 0", allocs)
+	}
+}
+
+func TestHasPointers(t *testing.T) {
+	type plain struct{ X, Y float64 }
+	type nested struct {
+		P plain
+		N [4]plain
+	}
+	type withString struct {
+		X    float64
+		Name string
+	}
+	type deep struct{ Inner nested }
+	type deepPtr struct{ Inner withString }
+
+	for _, tc := range []struct {
+		typ  reflect.Type
+		want bool
+	}{
+		{reflect.TypeFor[plain](), false},
+		{reflect.TypeFor[nested](), false},
+		{reflect.TypeFor[deep](), false},
+		{reflect.TypeFor[float64](), false},
+		{reflect.TypeFor[[8]int](), false},
+		{reflect.TypeFor[struct{}](), false},
+		{reflect.TypeFor[uintptr](), false},
+		{reflect.TypeFor[withString](), true},
+		{reflect.TypeFor[deepPtr](), true},
+		{reflect.TypeFor[*plain](), true},
+		{reflect.TypeFor[[]plain](), true},
+		{reflect.TypeFor[[2]withString](), true},
+		{reflect.TypeFor[map[int]int](), true},
+		{reflect.TypeFor[any](), true},
+		{reflect.TypeFor[func()](), true},
+		{reflect.TypeFor[Entity](), false},
+	} {
+		if got := hasPointers(tc.typ); got != tc.want {
+			t.Errorf("hasPointers(%s) = %v, want %v", tc.typ, got, tc.want)
+		}
+	}
+}
+
+func TestCleanReleasesComponentReferences(t *testing.T) {
+	type payload struct{ Data []byte }
+
+	w := NewWorld()
+	// Without this the world is dead after Clean — its last use below — and the
+	// buffer would be collected no matter what Clean did, passing vacuously.
+	defer runtime.KeepAlive(w)
+
+	e := w.NewEntity()
+	w.Set(e, payload{Data: make([]byte, 1024)})
+
+	collected := make(chan struct{}, 1)
+	runtime.AddCleanup(&w.Get[payload](e).Data[0], func(struct{}) { collected <- struct{}{} }, struct{}{})
+
+	w.Clean()
+
+	// The dense array is retained across Clean, so if clear did not zero a
+	// pointer-holding component the previous scene's buffer would stay reachable.
+	for range 10 {
+		runtime.GC()
+		select {
+		case <-collected:
+			return
+		default:
+		}
+	}
+	t.Fatal("component buffer still reachable after Clean")
 }

@@ -38,9 +38,10 @@ type Events[T any] struct {
 }
 
 // eventQueue is the type-erased view of an Events[T], used by the World to
-// advance every queue in FlushEvents.
+// advance every queue in FlushEvents and to drop them all in Clean.
 type eventQueue interface {
 	flush()
+	clear()
 }
 
 // Send appends an event to the queue. It stays readable until the second
@@ -66,6 +67,18 @@ func (ev *Events[T]) flush() {
 	ev.frontStart += uint64(len(ev.front))
 	clear(ev.back) // zero dropped events so anything they point at can be GC'd
 	ev.front, ev.back = ev.back[:0], ev.front
+}
+
+// clear drops every buffered event at once, keeping both buffers' capacity.
+// Sequence numbers advance past the dropped events instead of rewinding, so an
+// existing reader — whose cursor may sit anywhere in the discarded range —
+// resumes at the next event sent rather than replaying or skipping one.
+func (ev *Events[T]) clear() {
+	ev.frontStart += uint64(len(ev.front))
+	clear(ev.front) // zero dropped events so anything they point at can be GC'd
+	clear(ev.back)
+	ev.front = ev.front[:0]
+	ev.back = ev.back[:0]
 }
 
 // EventReader is one consumer's cursor into an Events[T] queue. Each reader

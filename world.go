@@ -60,6 +60,58 @@ func (w *World) Destroy(e Entity) {
 	w.free = append(w.free, index)
 }
 
+// Clean removes every entity, component, and buffered event from the world,
+// leaving it logically as empty as NewWorld but keeping all of its allocated
+// memory — the point being to rebuild a scene into arrays that are already the
+// right size, with no allocation and no GC churn on the transition.
+//
+// It is not a loop of Destroy calls: each storage is emptied in one shot
+// rather than probed once per entity, so the cost is a pass over the version
+// table plus O(1) work per component type, independent of how many components
+// each entity had.
+//
+// Everything systems cache stays valid: the *Storage[T] returned by Storage
+// and any Query built from the world keep working and observe the cleaned
+// state, so systems constructed once at startup survive any number of scene
+// transitions.
+//
+// Every Entity handle taken before the call is dead afterwards (Alive reports
+// false), including handles held inside components of the next scene. Buffered
+// events are dropped too — otherwise a queue could deliver last scene's events,
+// carrying now-dead entities, to the scene that replaces it.
+func (w *World) Clean() {
+	for _, s := range w.list {
+		s.clear()
+	}
+	for _, q := range w.eventsList {
+		q.clear()
+	}
+
+	n := len(w.versions)
+	if cap(w.free) < n {
+		w.free = make([]uint32, n)
+	}
+	versions, free := w.versions, w.free[:n]
+
+	// One forward pass over both tables — indexed stores rather than appends, so
+	// neither array pays a per-element capacity check.
+	//
+	// Bumping every version, rather than truncating the table, is what kills the
+	// old handles: reusing index 0 at version 1 again would make a stale handle
+	// from the previous scene alias a brand new entity. Indices already on the
+	// free list get bumped too, which is harmless (they are dead either way) and
+	// avoids a membership test to skip them.
+	//
+	// The free list gets every index, highest first, so NewEntity pops them in
+	// ascending order the way a fresh world hands them out — that keeps each
+	// storage's entity list sorted, so query probes walk sparse forwards.
+	for i := range versions {
+		versions[i]++
+		free[i] = uint32(n - 1 - i)
+	}
+	w.free = free
+}
+
 // Storage returns the Storage for component type T, creating it on first use.
 // Queries cache these, so the map lookup happens once per query, not per call.
 //
@@ -71,7 +123,7 @@ func (w *World) Storage[T any]() *Storage[T] {
 	if s, ok := w.storages[t]; ok {
 		return s.(*Storage[T])
 	}
-	s := &Storage[T]{w: w}
+	s := &Storage[T]{w: w, hasPtrs: hasPointers(t)}
 	w.storages[t] = s
 	w.list = append(w.list, s)
 	return s
